@@ -4,6 +4,7 @@ import os
 import requests
 import json
 import difflib
+import html as html_module
 from datetime import datetime
 
 # ─── Page Config ─────────────────────────────────────────────────────────────────
@@ -11,8 +12,13 @@ st.set_page_config(page_title="SQL Corrector", page_icon="🛠️", layout="wide
 st.title("🛠️ SQL Corrector")
 st.caption("Powered by GPT-4o · Auto-masking · Diff view · History")
 
+# ─── Constants ────────────────────────────────────────────────────────────────────
+MAX_SQL_CHARS   = 12_000   # ~3000 tokens — safe GPT-4o limit
+MAX_SCHEMA_CHARS = 4_000
+MAX_HISTORY      = 10
+
 # ─── API Key ─────────────────────────────────────────────────────────────────────
-def get_api_key_from_env():
+def get_api_key_from_env() -> str:
     try:
         return st.secrets["OPENAI_API_KEY"]
     except Exception:
@@ -29,7 +35,7 @@ for k, v in {
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ─── SQL Keywords (complete set) ──────────────────────────────────────────────────
+# ─── SQL Keywords ────────────────────────────────────────────────────────────────
 SQL_KEYWORDS = {
     "SELECT","FROM","WHERE","AND","OR","NOT","IN","EXISTS","BETWEEN","LIKE","ILIKE",
     "IS","NULL","JOIN","INNER","LEFT","RIGHT","FULL","OUTER","CROSS","NATURAL",
@@ -63,7 +69,7 @@ with st.sidebar:
             help="Get yours at platform.openai.com → API Keys"
         )
         if api_key:
-            st.caption("💡 Set `OPENAI_API_KEY` env var to skip this step.")
+            st.caption("💡 Set `OPENAI_API_KEY` env var to skip this each time.")
 
     st.divider()
     no_schema    = st.toggle("🚫 No-Schema Mode",
@@ -104,22 +110,55 @@ streamlit run sql_corrector.py
 # ═══════════════════════════════════════════════════════════════════════
 
 def sanitize_sql(sql: str) -> str:
-    """Fix invisible/smart characters only — no keyword injection."""
-    sql = sql.replace("\u00a0", " ")   # non-breaking space
-    sql = sql.replace("\u2019", "'")   # right single quote
-    sql = sql.replace("\u2018", "'")   # left single quote
-    sql = sql.replace("\u201c", '"')   # left double quote
-    sql = sql.replace("\u201d", '"')   # right double quote
-    sql = sql.replace("\u2013", "-")   # en dash
-    sql = sql.replace("\u2014", "-")   # em dash
-    sql = sql.replace("\u0060", "`")   # grave accent normalise
-    # collapse multiple spaces on a single line but keep newlines
+    """Fix invisible / smart characters. Never inject or rewrite tokens."""
+    replacements = {
+        "\u00a0": " ",   # non-breaking space
+        "\u2019": "'",   # right single quote
+        "\u2018": "'",   # left single quote
+        "\u201c": '"',   # left double quote
+        "\u201d": '"',   # right double quote
+        "\u2013": "-",   # en dash
+        "\u2014": "-",   # em dash
+        "\u0060": "`",   # grave accent
+        "\ufeff": "",    # BOM
+        "\u200b": "",    # zero-width space
+    }
+    for bad, good in replacements.items():
+        sql = sql.replace(bad, good)
+    # collapse multiple spaces per line; preserve newlines
     lines = [re.sub(r'[^\S\n]+', ' ', line).rstrip() for line in sql.splitlines()]
     return "\n".join(lines).strip()
 
 
+def strip_sql_strings(sql: str) -> str:
+    """
+    Return SQL with string literals replaced by a placeholder.
+    Used so masking never touches values inside quotes.
+    Also returns a restore map.
+    """
+    placeholders = {}
+    counter = [0]
+
+    def replacer(m):
+        key = f"__STR{counter[0]}__"
+        placeholders[key] = m.group(0)
+        counter[0] += 1
+        return key
+
+    # Match single-quoted, double-quoted, and backtick strings
+    stripped = re.sub(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|`(?:[^`\\]|\\.)*`",
+                      replacer, sql)
+    return stripped, placeholders
+
+
+def restore_sql_strings(sql: str, placeholders: dict) -> str:
+    for key, val in placeholders.items():
+        sql = sql.replace(key, val)
+    return sql
+
+
 def build_mask(aliases: list) -> dict:
-    """Real→alias map, skipping keywords, single chars, and numbers."""
+    """Real→alias map. Skips SQL keywords, single chars, and pure numbers."""
     mask = {}
     for real, alias in aliases:
         real, alias = real.strip(), alias.strip()
@@ -132,37 +171,53 @@ def build_mask(aliases: list) -> dict:
 
 
 def apply_mask(text: str, mask: dict) -> str:
+    """
+    Mask only identifier tokens — never content inside string literals.
+    """
+    if not mask:
+        return text
+    # Strip string literals first so values are never masked
+    stripped, placeholders = strip_sql_strings(text)
     for real, alias in sorted(mask.items(), key=lambda x: -len(x[0])):
-        text = text.replace(f"`{real}`", f"`{alias}`")
-        text = re.sub(
+        stripped = re.sub(
             r'(?<![`\w])' + re.escape(real) + r'(?![`\w])',
-            alias, text, flags=re.IGNORECASE
+            alias, stripped, flags=re.IGNORECASE
         )
-    return text
+    return restore_sql_strings(stripped, placeholders)
 
 
 def restore_mask(text: str, mask: dict) -> str:
+    """Reverse alias → real name, never touching string literals."""
+    if not mask:
+        return text
     reverse = {v: k for k, v in mask.items()}
+    stripped, placeholders = strip_sql_strings(text)
     for alias, real in sorted(reverse.items(), key=lambda x: -len(x[0])):
-        text = text.replace(f"`{alias}`", f"`{real}`")
-        text = re.sub(
+        stripped = re.sub(
             r'(?<![`\w])' + re.escape(alias) + r'(?![`\w])',
-            real, text, flags=re.IGNORECASE
+            real, stripped, flags=re.IGNORECASE
         )
-    return text
+    return restore_sql_strings(stripped, placeholders)
 
 
 def extract_from_sql(sql: str) -> list:
-    """Extract table & column names from SQL (CTEs, subqueries, UNIONs, multi-UPDATE)."""
+    """
+    Extract table names (after FROM/JOIN/UPDATE/INTO/WITH) and column names
+    (alias.column patterns and backtick-quoted identifiers).
+    Intentionally avoids comma-list patterns that match SELECT columns.
+    """
     pairs, seen, table_hits = [], set(), set()
     t_c, c_c = 1, 1
 
-    for pat in [
-        r'(?:FROM|JOIN|UPDATE|INTO)\s+`?([A-Za-z_][A-Za-z0-9_]*)`?',
-        r'WITH\s+`?([A-Za-z_][A-Za-z0-9_]*)`?\s+AS\s*\(',
-        r',\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s+(?:AS\s+)?[a-zA-Z]\b',
-    ]:
-        for m in re.finditer(pat, sql, re.IGNORECASE):
+    # Strip string literals so we don't extract values as identifiers
+    stripped, _ = strip_sql_strings(sql)
+
+    table_patterns = [
+        r'(?:FROM|JOIN|UPDATE|INTO)\s+([A-Za-z_][A-Za-z0-9_]*)',
+        r'WITH\s+([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(',
+    ]
+    for pat in table_patterns:
+        for m in re.finditer(pat, stripped, re.IGNORECASE):
             tok = m.group(1)
             if tok.upper() not in SQL_KEYWORDS and len(tok) > 1:
                 table_hits.add(tok)
@@ -173,11 +228,11 @@ def extract_from_sql(sql: str) -> list:
             pairs.append((tok, f"t{t_c}"))
             t_c += 1
 
-    for pat in [
-        r'[a-zA-Z0-9_]\.[`]?([A-Za-z_][A-Za-z0-9_]*)[`]?',
-        r'`([A-Za-z_][A-Za-z0-9_]*)`',
-    ]:
-        for m in re.finditer(pat, sql, re.IGNORECASE):
+    col_patterns = [
+        r'[A-Za-z_][A-Za-z0-9_]*\.([A-Za-z_][A-Za-z0-9_]*)',  # alias.column
+    ]
+    for pat in col_patterns:
+        for m in re.finditer(pat, stripped, re.IGNORECASE):
             tok = m.group(1)
             if (tok.upper() not in SQL_KEYWORDS
                     and tok not in seen and len(tok) > 1):
@@ -188,6 +243,7 @@ def extract_from_sql(sql: str) -> list:
 
 
 def extract_from_schema(schema: str) -> list:
+    """Extract table and column names from a schema definition string."""
     pairs, seen = [], set()
     t_c, c_c = 1, 1
     for tok in dict.fromkeys(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', schema)):
@@ -202,20 +258,50 @@ def extract_from_schema(schema: str) -> list:
 
 
 def split_statements(sql: str) -> list:
-    """Split on ; but ignore semicolons inside quotes or parentheses."""
-    stmts, current, depth, in_str, str_char = [], [], 0, False, None
-    for ch in sql:
+    """
+    Split on semicolons, correctly handling:
+    - single-quoted strings  'it''s fine'
+    - double-quoted identifiers "my table"
+    - backtick identifiers `table`
+    - nested parentheses
+    - escaped characters inside strings
+    """
+    stmts, current = [], []
+    depth    = 0
+    in_str   = False
+    str_char = None
+    prev_ch  = None
+    i        = 0
+
+    while i < len(sql):
+        ch = sql[i]
+
         if in_str:
             current.append(ch)
-            if ch == str_char:
-                in_str = False
+            # Handle escaped char (backslash escape or doubled-quote escape)
+            if ch == '\\' and str_char in ("'", '"'):
+                # consume next char as escaped
+                i += 1
+                if i < len(sql):
+                    current.append(sql[i])
+            elif ch == str_char:
+                # doubled quote escape: '' inside single-quoted string
+                if (i + 1 < len(sql)
+                        and sql[i + 1] == str_char
+                        and str_char in ("'", '"')):
+                    i += 1
+                    current.append(sql[i])
+                else:
+                    in_str = False
         elif ch in ("'", '"', '`'):
             in_str, str_char = True, ch
             current.append(ch)
         elif ch == '(':
-            depth += 1; current.append(ch)
+            depth += 1
+            current.append(ch)
         elif ch == ')':
-            depth -= 1; current.append(ch)
+            depth = max(0, depth - 1)   # guard against unbalanced parens
+            current.append(ch)
         elif ch == ';' and depth == 0:
             stmt = "".join(current).strip()
             if stmt:
@@ -223,6 +309,10 @@ def split_statements(sql: str) -> list:
             current = []
         else:
             current.append(ch)
+
+        prev_ch = ch
+        i += 1
+
     last = "".join(current).strip()
     if last:
         stmts.append(last)
@@ -230,11 +320,23 @@ def split_statements(sql: str) -> list:
 
 
 def parse_gpt_response(raw: str):
-    """Extract SQL block + explanation. Robust fallback if no code fence."""
-    m = re.search(r"```(?:sql)?\s*(.*?)```", raw, re.DOTALL | re.IGNORECASE)
-    if m:
-        return m.group(1).strip(), raw[m.end():].strip()
-    # Fallback: find first SQL keyword line
+    """
+    Extract corrected SQL and explanation from GPT output.
+    Strategy:
+      1. Look for the LAST ```sql ... ``` block (GPT sometimes adds preamble).
+      2. Everything before the block = preamble (ignored).
+      3. Everything after the block = explanation.
+      4. Fallback: scan for first line starting with a DML/DDL keyword.
+    """
+    # Find ALL sql code blocks; take the last one
+    matches = list(re.finditer(r"```(?:sql)?\s*(.*?)```", raw, re.DOTALL | re.IGNORECASE))
+    if matches:
+        m = matches[-1]
+        sql_block   = m.group(1).strip()
+        explanation = raw[m.end():].strip()
+        return sql_block, explanation
+
+    # Fallback: detect SQL start
     sql_start = re.compile(
         r'^\s*(SELECT|UPDATE|DELETE|INSERT|WITH|CREATE|DROP|ALTER|MERGE|REPLACE)\b',
         re.IGNORECASE
@@ -244,14 +346,23 @@ def parse_gpt_response(raw: str):
     for line in lines:
         if not in_sql and sql_start.match(line):
             in_sql = True
-        (sql_lines if in_sql else note_lines).append(line)
+        if in_sql:
+            # Stop SQL block when we hit a line that looks like a bullet/explanation
+            if re.match(r'^\s*[-*•]\s+\w', line) and sql_lines:
+                in_sql = False
+                note_lines.append(line)
+            else:
+                sql_lines.append(line)
+        else:
+            note_lines.append(line)
+
     if sql_lines:
         return "\n".join(sql_lines).strip(), "\n".join(note_lines).strip()
     return raw.strip(), ""
 
 
 def make_diff_html(original: str, corrected: str) -> str:
-    """Side-by-side diff with line numbers and guaranteed inline colors."""
+    """Side-by-side diff with line numbers, HTML-escaped content, inline styles."""
     orig_lines = original.splitlines()
     corr_lines = corrected.splitlines()
     matcher    = difflib.SequenceMatcher(None, orig_lines, corr_lines)
@@ -259,17 +370,19 @@ def make_diff_html(original: str, corrected: str) -> str:
     left_rows, right_rows = [], []
     orig_ln, corr_ln = 1, 1
 
-    S = "padding:3px 8px;font-family:'Courier New',monospace;font-size:12px;white-space:pre-wrap;"
-    N = "padding:3px 6px;font-size:11px;text-align:right;min-width:36px;user-select:none;border-right:1px solid #2a2a2a;"
+    S = ("padding:3px 8px;font-family:'Courier New',monospace;"
+         "font-size:12px;white-space:pre-wrap;word-break:break-all;")
+    N = ("padding:3px 6px;font-size:11px;text-align:right;"
+         "min-width:36px;user-select:none;border-right:1px solid #2a2a2a;")
 
-    def escape_html(s):
-        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    def esc(s):
+        return html_module.escape(s) if s else "&nbsp;"
 
     def row(ln, line, bg, fg, lbg="#1a1a1a", lfc="#444"):
         return (
             f'<tr>'
             f'<td style="{N}background:{lbg};color:{lfc};">{ln}</td>'
-            f'<td style="{S}background:{bg};color:{fg};">{escape_html(line) if line else "&nbsp;"}</td>'
+            f'<td style="{S}background:{bg};color:{fg};">{esc(line)}</td>'
             f'</tr>'
         )
 
@@ -294,25 +407,29 @@ def make_diff_html(original: str, corrected: str) -> str:
         elif tag == "delete":
             for lo in orig_lines[i1:i2]:
                 left_rows.append(row(orig_ln, lo, "#3d1515", "#ff9090", "#2a0e0e", "#c04040"))
-                right_rows.append(row("", "", "#111", "#222"))
+                right_rows.append(row("", "", "#111111", "#111111"))
                 orig_ln += 1
 
         elif tag == "insert":
             for lc in corr_lines[j1:j2]:
-                left_rows.append(row("", "", "#111", "#222"))
+                left_rows.append(row("", "", "#111111", "#111111"))
                 right_rows.append(row(corr_ln, lc, "#153d15", "#90e890", "#0e2a0e", "#40c040"))
                 corr_ln += 1
 
     def tbl(rows):
-        return f'<table style="width:100%;border-collapse:collapse;">{"".join(rows)}</table>'
+        return (f'<table style="width:100%;border-collapse:collapse;">'
+                + "".join(rows) + '</table>')
 
     return f"""
     <div style="background:#111;border-radius:8px;overflow:hidden;border:1px solid #2a2a2a;">
       <div style="display:grid;grid-template-columns:1fr 1fr;background:#1e1e1e;border-bottom:1px solid #333;">
-        <div style="padding:8px 14px;color:#ff8080;font-weight:bold;font-size:13px;border-right:1px solid #333;">❌ Original</div>
-        <div style="padding:8px 14px;color:#80e880;font-weight:bold;font-size:13px;">✅ Corrected</div>
+        <div style="padding:8px 14px;color:#ff8080;font-weight:bold;font-size:13px;
+                    border-right:1px solid #333;">❌ Original</div>
+        <div style="padding:8px 14px;color:#80e880;font-weight:bold;font-size:13px;">
+                    ✅ Corrected</div>
       </div>
-      <div style="padding:5px 14px;background:#161616;border-bottom:1px solid #222;font-size:11px;color:#666;display:flex;gap:24px;">
+      <div style="padding:5px 14px;background:#161616;border-bottom:1px solid #222;
+                  font-size:11px;color:#666;display:flex;gap:24px;">
         <span><span style="color:#ff8080;">■</span> Removed / wrong</span>
         <span><span style="color:#80e880;">■</span> Added / fixed</span>
         <span><span style="color:#888;">■</span> Unchanged</span>
@@ -326,24 +443,41 @@ def make_diff_html(original: str, corrected: str) -> str:
 
 
 def copy_button_html(text: str, btn_id: str) -> str:
-    """Clipboard copy using modern navigator.clipboard API with execCommand fallback."""
-    safe = text.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
+    """
+    XSS-safe copy button.
+    Text is JSON-encoded so it is safe inside a JS string regardless of
+    backticks, dollar signs, quotes, or newlines in the SQL.
+    """
+    json_text = json.dumps(text)   # produces a safe JS string literal
     return f"""
-    <button id="{btn_id}" onclick="
-      var txt = `{safe}`;
-      if (navigator.clipboard) {{
-        navigator.clipboard.writeText(txt).then(function() {{
-          document.getElementById('{btn_id}').innerText = '✅ Copied!';
-          setTimeout(function(){{document.getElementById('{btn_id}').innerText='📋 Copy SQL'}}, 2000);
-        }});
-      }} else {{
-        var ta = document.createElement('textarea');
-        ta.value = txt; document.body.appendChild(ta);
-        ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
-        document.getElementById('{btn_id}').innerText = '✅ Copied!';
-        setTimeout(function(){{document.getElementById('{btn_id}').innerText='📋 Copy SQL'}}, 2000);
-      }}
-    " style="background:#2563eb;color:#fff;border:none;border-radius:6px;
+    <button id="{btn_id}"
+      onclick="
+        var txt = {json_text};
+        var btn = document.getElementById('{btn_id}');
+        if (navigator.clipboard && window.isSecureContext) {{
+          navigator.clipboard.writeText(txt)
+            .then(function() {{
+              btn.innerText = '✅ Copied!';
+              setTimeout(function() {{ btn.innerText = '📋 Copy SQL'; }}, 2000);
+            }})
+            .catch(function() {{ fallbackCopy(txt, btn); }});
+        }} else {{
+          fallbackCopy(txt, btn);
+        }}
+        function fallbackCopy(t, b) {{
+          var ta = document.createElement('textarea');
+          ta.value = t;
+          ta.style.position = 'fixed';
+          ta.style.opacity  = '0';
+          document.body.appendChild(ta);
+          ta.focus(); ta.select();
+          try {{ document.execCommand('copy'); b.innerText = '✅ Copied!'; }}
+          catch(e) {{ b.innerText = '⚠️ Copy failed'; }}
+          document.body.removeChild(ta);
+          setTimeout(function() {{ b.innerText = '📋 Copy SQL'; }}, 2000);
+        }}
+      "
+      style="background:#2563eb;color:#fff;border:none;border-radius:6px;
              padding:8px 20px;font-size:14px;cursor:pointer;margin:4px 0;">
       📋 Copy SQL
     </button>
@@ -351,6 +485,7 @@ def copy_button_html(text: str, btn_id: str) -> str:
 
 
 def call_gpt(key: str, system_prompt: str, user_message: str) -> str:
+    """Call OpenAI GPT-4o. Raises RuntimeError with human-friendly messages."""
     headers = {
         "Authorization": f"Bearer {key.strip()}",
         "Content-Type": "application/json",
@@ -358,7 +493,7 @@ def call_gpt(key: str, system_prompt: str, user_message: str) -> str:
     body = {
         "model": "gpt-4o",
         "max_tokens": 2000,
-        "temperature": 0,
+        "temperature": 0,       # deterministic — we want exact fixes
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_message},
@@ -367,44 +502,82 @@ def call_gpt(key: str, system_prompt: str, user_message: str) -> str:
     try:
         resp = requests.post(
             "https://api.openai.com/v1/chat/completions",
+            json=body,           # use json= not data= for correct encoding
             headers=headers,
-            data=json.dumps(body),
             timeout=60,
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        data = resp.json()
+        # Guard against malformed response structure
+        if not data.get("choices") or not data["choices"][0].get("message"):
+            raise RuntimeError("OpenAI returned an empty response. Please try again.")
+        return data["choices"][0]["message"]["content"]
+
+    except requests.Timeout:
+        raise RuntimeError("Request timed out (60s). The query may be too large — try splitting it.")
+    except requests.ConnectionError:
+        raise RuntimeError("Could not reach OpenAI. Check your internet connection.")
     except requests.HTTPError as e:
         code = e.response.status_code
+        try:
+            msg = e.response.json().get("error", {}).get("message", "")
+        except Exception:
+            msg = e.response.text[:200]
         if code == 401:
-            raise RuntimeError("Invalid API key. Check your OpenAI key and try again.")
+            raise RuntimeError("Invalid API key. Check your OpenAI key in the sidebar.")
         elif code == 429:
-            raise RuntimeError("Rate limit exceeded. Wait a moment and retry.")
+            raise RuntimeError("Rate limit or quota exceeded. Wait a moment or check your OpenAI usage limits.")
         elif code == 400:
-            raise RuntimeError(f"Bad request: {e.response.json().get('error',{}).get('message','unknown error')}")
+            raise RuntimeError(f"Bad request: {msg}")
+        elif code == 503:
+            raise RuntimeError("OpenAI is temporarily unavailable. Try again in a few seconds.")
         else:
-            raise RuntimeError(f"OpenAI API error {code}. Please try again.")
+            raise RuntimeError(f"OpenAI API error {code}: {msg}")
 
 
 def build_system_prompt(dialect: str) -> str:
-    return f"""You are a senior SQL expert specializing in {dialect}.
+    return f"""You are a senior SQL expert and code reviewer specializing in {dialect}.
 
-Fix the SQL query provided. Rules:
+Your task is to fix the SQL query the user provides. Follow these rules exactly:
+
 1. Return ONLY the corrected SQL inside a ```sql code block.
-2. After the block, list every fix as bullet points with line references where possible.
-3. Fix ALL of:
-   - Typos / syntax errors in keywords (FORM→FROM, WHRE→WHERE etc.)
-   - Missing spaces between concatenated tokens (e.g. order_idand → order_id AND)
-   - Missing or wrong JOIN conditions
-   - Ambiguous column references (prefix with table alias)
-   - Non-aggregated columns outside GROUP BY
-   - Subquery missing alias
-   - CTE (WITH clause) syntax errors
-   - UNION / INTERSECT column count mismatch
-   - Dialect-specific issues ({dialect})
-4. Preserve the original query's intent and structure.
-5. If no errors found, return SQL unchanged and say "No errors found."
-6. Do NOT add SQL comments inside the corrected query.
+2. After the code block, list every change as bullet points.
+   - Reference specific parts of the query (e.g. "JOIN condition", "WHERE clause", "line 4").
+3. Fix ALL of the following if present:
+   - Keyword typos (FORM→FROM, WHRE→WHERE, SELCT→SELECT, etc.)
+   - Missing spaces between concatenated tokens (e.g. "order_idAND" → "order_id AND")
+   - Missing or incorrect JOIN ON conditions
+   - Ambiguous column references — add table alias prefix where needed
+   - Non-aggregated columns in SELECT that are not in GROUP BY
+   - Subqueries missing an alias
+   - CTE (WITH clause) syntax issues
+   - UNION / INTERSECT / EXCEPT with mismatched column counts or types
+   - Missing commas in SELECT lists
+   - Incorrect quoting for the dialect (e.g. MySQL backticks vs ANSI double-quotes)
+   - {dialect}-specific syntax issues
+4. Do NOT reformat or reorder the query beyond what is needed to fix errors.
+5. Do NOT add comments inside the corrected SQL.
+6. Preserve all original aliases, column names, and query intent exactly.
+7. If the query has no errors, return it unchanged and write only: "No errors found."
 """
+
+
+def validate_inputs(sql: str, schema: str) -> str | None:
+    """Return an error message string if inputs are invalid, else None."""
+    if len(sql) > MAX_SQL_CHARS:
+        return (f"SQL is too large ({len(sql):,} chars). "
+                f"Maximum is {MAX_SQL_CHARS:,} characters (~3000 tokens). "
+                f"Please split into smaller queries.")
+    if schema and len(schema) > MAX_SCHEMA_CHARS:
+        return (f"Schema is too large ({len(schema):,} chars). "
+                f"Maximum is {MAX_SCHEMA_CHARS:,} characters. "
+                f"Include only the tables referenced in the query.")
+    if not re.search(
+        r'\b(SELECT|INSERT|UPDATE|DELETE|WITH|CREATE|ALTER|DROP|MERGE)\b',
+        sql, re.IGNORECASE
+    ):
+        return "This doesn't look like a SQL query. Please check the input."
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -417,27 +590,37 @@ with col1:
     st.subheader("📝 Your SQL")
     sql_input = st.text_area(
         "Paste your SQL query here", height=220,
-        placeholder="SELECT * FORM users WHRE id = 1\n-- supports CTEs, subqueries, multi-statement"
+        placeholder=(
+            "SELECT * FORM users WHRE id = 1\n"
+            "-- Supports CTEs, subqueries, JOINs, multi-statement"
+        )
     )
+    if sql_input:
+        char_count = len(sql_input)
+        color = "red" if char_count > MAX_SQL_CHARS else ("orange" if char_count > MAX_SQL_CHARS * 0.8 else "green")
+        st.caption(f":{color}[{char_count:,} / {MAX_SQL_CHARS:,} characters]")
 
     st.subheader("🗂️ Schema (optional)")
     schema_input = st.text_area(
         "Describe your tables", height=110,
-        placeholder="users(id INT, email VARCHAR, salary DECIMAL)\norders(id INT, user_id INT, total DECIMAL)",
+        placeholder=(
+            "users(id INT, email VARCHAR, salary DECIMAL)\n"
+            "orders(id INT, user_id INT, total DECIMAL, status VARCHAR)"
+        ),
         disabled=no_schema,
     )
 
     # ── Alias Editor ───────────────────────────────────────────────────────
     if use_masking and not no_schema:
         st.subheader("🎭 Alias Mapping")
-        st.caption("Single-letter aliases (a, b, c…) and SQL keywords are never masked.")
+        st.caption("Single-letter identifiers and SQL keywords are never masked.")
 
         b1, b2 = st.columns(2)
         if b1.button("⚡ From schema", use_container_width=True):
             if schema_input.strip():
                 st.session_state.aliases = extract_from_schema(schema_input)
             else:
-                st.warning("Schema empty — use 'From SQL query' instead.")
+                st.warning("Schema is empty — use 'From SQL query' instead.")
         if b2.button("🔎 From SQL query", use_container_width=True):
             if sql_input.strip():
                 st.session_state.aliases = extract_from_sql(sql_input)
@@ -474,15 +657,18 @@ with col2:
 
     if st.session_state.corrected:
         st.code(st.session_state.corrected, language="sql")
-        st.components.v1.html(copy_button_html(st.session_state.corrected, "cp_top"), height=50)
+        st.components.v1.html(
+            copy_button_html(st.session_state.corrected, "cp_top"), height=50
+        )
         if st.session_state.changes:
             with st.expander("📋 Changes made", expanded=True):
                 st.markdown(st.session_state.changes)
     else:
         st.info("Your corrected SQL will appear here.")
 
-    # ── Process ─────────────────────────────────────────────────────────────
+    # ── Process on button press ─────────────────────────────────────────────
     if fix_btn:
+        # ── Validation ──────────────────────────────────────────────────────
         if not api_key:
             st.error("❌ No API key found. Enter it in the sidebar or set the OPENAI_API_KEY environment variable.")
             st.stop()
@@ -490,19 +676,22 @@ with col2:
             st.warning("⚠️ Paste a SQL query on the left first.")
             st.stop()
 
-        # Sanitize
         clean_sql = sanitize_sql(sql_input)
+        err = validate_inputs(clean_sql, schema_input)
+        if err:
+            st.error(f"⚠️ {err}")
+            st.stop()
 
-        # Multi-statement info
+        # ── Multi-statement info ─────────────────────────────────────────────
         statements = split_statements(clean_sql)
         if len(statements) > 1:
-            st.info(f"🔢 Detected {len(statements)} SQL statements — fixing as one block.")
+            st.info(f"🔢 Detected {len(statements)} SQL statement(s) — sending as one block.")
 
-        # Mask
+        # ── Masking ─────────────────────────────────────────────────────────
         masked_sql    = apply_mask(clean_sql, mask)    if mask else clean_sql
-        masked_schema = "" if no_schema else (apply_mask(schema_input, mask) if mask else schema_input)
+        masked_schema = ("" if no_schema
+                         else (apply_mask(schema_input, mask) if mask else schema_input))
 
-        # Masking preview
         if mask:
             with st.expander("🎭 Masking conversion", expanded=True):
                 mc1, mc2 = st.columns(2)
@@ -514,13 +703,13 @@ with col2:
                 st.markdown("**Masked SQL sent to API:**")
                 st.code(masked_sql, language="sql")
 
-        # Prompt
+        # ── Prompt ──────────────────────────────────────────────────────────
         system   = build_system_prompt(dialect)
         user_msg = f"Fix this SQL:\n\n```sql\n{masked_sql}\n```"
         if masked_schema:
             user_msg += f"\n\nSchema:\n{masked_schema}"
 
-        # Payload inspector
+        # ── Payload inspector ────────────────────────────────────────────────
         with st.expander("🔍 Exact payload sent to API", expanded=False):
             preview = {
                 "model": "gpt-4o", "temperature": 0, "max_tokens": 2000,
@@ -537,38 +726,39 @@ with col2:
             else:
                 st.success("✅ Schema empty / not sent.")
 
-        # Call GPT
-        with st.spinner("Asking GPT-4o…"):
+        # ── Call GPT ────────────────────────────────────────────────────────
+        with st.spinner("Asking GPT-4o… (may take up to 30s for large queries)"):
             try:
                 raw = call_gpt(api_key, system, user_msg)
                 masked_corrected, explanation = parse_gpt_response(raw)
 
                 if not masked_corrected:
-                    st.error("GPT returned an unexpected format. Check the payload inspector above.")
+                    st.error("GPT returned an unexpected format.")
                     with st.expander("Raw GPT response"):
                         st.text(raw)
                     st.stop()
 
                 corrected = restore_mask(masked_corrected, mask) if mask else masked_corrected
 
-                # Save to session
+                # ── Save session state ───────────────────────────────────────
                 st.session_state.corrected = corrected
                 st.session_state.original  = clean_sql
                 st.session_state.changes   = explanation
 
-                # Save to history
+                # ── Save history (preview only to save memory) ───────────────
                 if show_history:
                     st.session_state.history.insert(0, {
                         "time":      datetime.now().strftime("%H:%M:%S"),
                         "dialect":   dialect,
                         "preview":   clean_sql[:80] + ("…" if len(clean_sql) > 80 else ""),
-                        "original":  clean_sql,
-                        "corrected": corrected,
+                        # Store full SQL only if under 2000 chars to save memory
+                        "original":  clean_sql  if len(clean_sql)  < 2000 else clean_sql[:2000]  + "\n-- [truncated]",
+                        "corrected": corrected  if len(corrected)  < 2000 else corrected[:2000]  + "\n-- [truncated]",
                         "changes":   explanation,
                     })
-                    st.session_state.history = st.session_state.history[:10]
+                    st.session_state.history = st.session_state.history[:MAX_HISTORY]
 
-                # Show result
+                # ── Display ──────────────────────────────────────────────────
                 st.code(corrected, language="sql")
                 st.components.v1.html(copy_button_html(corrected, "cp_result"), height=50)
 
@@ -584,7 +774,7 @@ with col2:
                 st.error(f"❌ Unexpected error: {e}")
 
 
-# ── Diff View ────────────────────────────────────────────────────────────
+# ── Diff View ────────────────────────────────────────────────────────────────────
 if show_diff and st.session_state.corrected and st.session_state.original:
     st.divider()
     st.subheader("🔀 Diff — What Changed")
@@ -592,7 +782,7 @@ if show_diff and st.session_state.corrected and st.session_state.original:
     st.components.v1.html(diff_html, height=520, scrolling=True)
 
 
-# ── Query History ─────────────────────────────────────────────────────────
+# ── Query History ─────────────────────────────────────────────────────────────────
 if show_history and st.session_state.history:
     st.divider()
     st.subheader("🕐 Query History (this session)")
@@ -610,6 +800,6 @@ if show_history and st.session_state.history:
         st.rerun()
 
 
-# ─── Footer ───────────────────────────────────────────────────────────────
+# ── Footer ───────────────────────────────────────────────────────────────────────
 st.divider()
-st.caption("🔒 Nothing stored or logged. Real names never leave your browser when masking is on.")
+st.caption("🔒 Nothing stored or logged. Real names never leave your machine when masking is on.")
